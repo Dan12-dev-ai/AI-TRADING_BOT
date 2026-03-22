@@ -1,0 +1,686 @@
+# Medallion-X Trading Bot - HashiCorp Vault Configuration
+# Production-ready secrets management with auto-unseal and dynamic secrets
+
+---
+# Vault Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault
+  labels:
+    app: vault
+    component: security
+
+---
+# Vault Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+    version: v1.15.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault
+      component: security
+  template:
+    metadata:
+      labels:
+        app: vault
+        component: security
+        version: v1.15.0
+    spec:
+      serviceAccountName: vault
+      securityContext:
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: vault
+        image: vault:1.15.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - vault
+        - server
+        - -config=/vault/config/vault.hcl
+        env:
+        - name: VAULT_ADDR
+          value: "https://vault.medallionx.com:8200"
+        - name: VAULT_API_ADDR
+          value: "https://vault.medallionx.com:8200"
+        - name: VAULT_CLUSTER_ADDR
+          value: "https://vault.medallionx.com:8201"
+        - name: VAULT_RAFT_API_ADDR
+          value: "https://$(POD_NAME).vault-internal:8201"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: VAULT_TLS_CERT_FILE
+          value: /vault/tls/server.crt
+        - name: VAULT_TLS_KEY_FILE
+          value: /vault/tls/server.key
+        - name: VAULT_TLS_CA_CERT_FILE
+          value: /vault/tls/ca.crt
+        ports:
+        - containerPort: 8200
+          name: vault
+          protocol: TCP
+        - containerPort: 8201
+          name: cluster
+          protocol: TCP
+        - containerPort: 8202
+          name: raft
+          protocol: TCP
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: vault-config
+          mountPath: /vault/config
+          readOnly: true
+        - name: vault-tls
+          mountPath: /vault/tls
+          readOnly: true
+        - name: vault-raft
+          mountPath: /vault/file
+        livenessProbe:
+          httpGet:
+            path: /v1/sys/health
+            port: 8200
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /v1/sys/health?standbyok=true&perfstandbyok=true
+            port: 8200
+            scheme: HTTPS
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+      volumes:
+      - name: vault-config
+        configMap:
+          name: vault-config
+      - name: vault-tls
+        secret:
+          secretName: vault-tls
+      - name: vault-raft
+        persistentVolumeClaim:
+          claimName: vault-raft-pvc
+      nodeSelector:
+        node-type: security
+        zone: security-zone
+      tolerations:
+      - key: "security-node"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+---
+# Vault Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8200
+    targetPort: 8200
+    protocol: TCP
+    name: vault
+  - port: 8201
+    targetPort: 8201
+    protocol: TCP
+    name: cluster
+  - port: 8202
+    targetPort: 8202
+    protocol: TCP
+    name: raft
+  selector:
+    app: vault
+    component: security
+
+---
+# Vault Headless Service for Raft
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault-internal
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 8200
+    targetPort: 8200
+    protocol: TCP
+    name: vault
+  - port: 8201
+    targetPort: 8201
+    protocol: TCP
+    name: cluster
+  - port: 8202
+    targetPort: 8202
+    protocol: TCP
+    name: raft
+  selector:
+    app: vault
+    component: security
+
+---
+# Vault Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+
+---
+# Vault ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-config
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+data:
+  vault.hcl: |
+    ui = true
+    
+    listener "tcp" {
+      address = "0.0.0.0:8200"
+      cluster_address = "0.0.0.0:8201"
+      tls_cert_file = "/vault/tls/server.crt"
+      tls_key_file = "/vault/tls/server.key"
+      tls_client_ca_file = "/vault/tls/ca.crt"
+      tls_min_version = "tls12"
+      tls_require_and_verify_client_cert = false
+    }
+    
+    storage "raft" {
+      path = "/vault/file"
+      node_id = "{{env `POD_NAME`}}"
+    }
+    
+    api_addr = "https://vault.medallionx.com:8200"
+    cluster_addr = "https://$(POD_NAME).vault-internal:8201"
+    
+    # Auto-unseal configuration
+    seal "awskms" {
+      region     = "us-east-1"
+      kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abcd1234-5678-90ef-1234-567890abcdef"
+      access_key = "YOUR_AWS_ACCESS_KEY"
+      secret_key = "YOUR_AWS_SECRET_KEY"
+    }
+    
+    # Audit logging
+    audit "file" {
+      path = "/vault/logs/audit.log"
+      mode = "0640"
+      format = "json"
+    }
+    
+    # Telemetry
+    telemetry {
+      prometheus_retention_time = "24h"
+      disable_hostname = true
+      prometheus_sink {
+        address = "http://prometheus-service:9090"
+      }
+    }
+
+---
+# Vault Persistent Volume Claim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vault-raft-pvc
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# Vault TLS Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-tls
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+type: kubernetes.io/tls
+data:
+  server.crt: <base64-encoded-server-certificate>
+  server.key: <base64-encoded-server-key>
+  ca.crt: <base64-encoded-ca-certificate>
+
+---
+# Vault RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vault
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+rules:
+- apiGroups: [""]
+  resources: ["pods", "secrets", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vault
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+subjects:
+- kind: ServiceAccount
+  name: vault
+  namespace: vault
+roleRef:
+  kind: Role
+  name: vault
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Vault Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vault-ingress
+  namespace: vault
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "128m"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - vault.medallionx.com
+    secretName: vault-tls-ingress
+  rules:
+  - host: vault.medallionx.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vault
+            port:
+              number: 8200
+
+---
+# Vault Init Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-init
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+spec:
+  template:
+    metadata:
+      labels:
+        app: vault
+        component: security
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: vault
+      containers:
+      - name: vault-init
+        image: vault:1.15.0
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Wait for Vault to be ready
+          until vault status -address=https://vault:8200; do
+            echo "Waiting for Vault to be ready..."
+            sleep 2
+          done
+          
+          # Initialize Vault if not already initialized
+          if ! vault operator init -status -address=https://vault:8200; then
+            echo "Initializing Vault..."
+            vault operator init -address=https://vault:8200 -key-shares=5 -key-threshold=3 -format=json > /vault/init/keys.json
+          fi
+          
+          # Unseal Vault
+          echo "Unsealing Vault..."
+          vault operator unseal -address=https://vault:8200 $(jq -r '.unseal_keys_b64[0]' /vault/init/keys.json | base64 -d)
+          vault operator unseal -address=https://vault:8200 $(jq -r '.unseal_keys_b64[1]' /vault/init/keys.json | base64 -d)
+          vault operator unseal -address=https://vault:8200 $(jq -r '.unseal_keys_b64[2]' /vault/init/keys.json | base64 -d)
+          
+          # Login and configure
+          echo "Logging in and configuring Vault..."
+          export VAULT_TOKEN=$(jq -r '.root_token' /vault/init/keys.json)
+          
+          # Enable auth methods
+          vault auth enable kubernetes -address=https://vault:8200
+          vault auth enable approle -address=https://vault:8200
+          vault auth enable oidc -address=https://vault:8200
+          
+          # Configure Kubernetes auth
+          vault write auth/kubernetes/config \
+            kubernetes_host="https://kubernetes.default.svc:443" \
+            kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+            token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token \
+            issuer="kubernetes.default.svc.cluster.local" \
+            address=https://vault:8200
+          
+          # Create policies
+          vault policy write medallionx-trading -address=https://vault:8200 <<EOF
+          path "secret/data/medallionx/trading/*" {
+            capabilities = ["read", "update"]
+          }
+          path "secret/data/medallionx/exchanges/*" {
+            capabilities = ["read"]
+          }
+          path "database/creds/medallionx" {
+            capabilities = ["read"]
+          }
+          EOF
+          
+          vault policy write medallionx-monitoring -address=https://vault:8200 <<EOF
+          path "secret/data/medallionx/monitoring/*" {
+            capabilities = ["read"]
+          }
+          EOF
+          
+          # Create roles
+          vault write auth/kubernetes/role/medallionx-trading \
+            bound_service_account_names=medallionx-service-account \
+            bound_service_account_namespaces=medallionx \
+            policies=medallionx-trading \
+            ttl=24h \
+            address=https://vault:8200
+          
+          vault write auth/kubernetes/role/medallionx-monitoring \
+            bound_service_account_names=prometheus,grafana \
+            bound_service_account_namespaces=medallionx \
+            policies=medallionx-monitoring \
+            ttl=24h \
+            address=https://vault:8200
+          
+          # Store initial secrets
+          vault kv put secret/medallionx/trading/config \
+            max_slippage=0.001 \
+            max_position_size=0.1 \
+            kelly_multiplier=0.25 \
+            address=https://vault:8200
+          
+          echo "Vault initialization complete!"
+        env:
+        - name: VAULT_ADDR
+          value: "https://vault:8200"
+        - name: VAULT_SKIP_VERIFY
+          value: "true"
+        volumeMounts:
+        - name: vault-init
+          mountPath: /vault/init
+        - name: vault-ca
+          mountPath: /vault/tls
+          readOnly: true
+      volumes:
+      - name: vault-init
+        emptyDir: {}
+      - name: vault-ca
+        secret:
+          secretName: vault-tls
+
+---
+# Vault Unsealer DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vault-unsealer
+  namespace: vault
+  labels:
+    app: vault
+    component: unsealer
+spec:
+  selector:
+    matchLabels:
+      app: vault
+      component: unsealer
+  template:
+    metadata:
+      labels:
+        app: vault
+        component: unsealer
+    spec:
+      serviceAccountName: vault
+      containers:
+      - name: vault-unsealer
+        image: vault:1.15.0
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Check if Vault is sealed
+          if vault status -address=https://vault:8200 -format=json | jq -r '.sealed' | grep -q true; then
+            echo "Vault is sealed, attempting to unseal..."
+            
+            # Get unseal keys from secure storage (AWS KMS, HashiCorp Cloud, etc.)
+            # This is a simplified example - in production, use proper secure key management
+            UNSEAL_KEY_1=$(aws kms decrypt --ciphertext-blob fileb:///vault/secrets/unseal-key-1.enc --output text --query Plaintext --base64)
+            UNSEAL_KEY_2=$(aws kms decrypt --ciphertext-blob fileb:///vault/secrets/unseal-key-2.enc --output text --query Plaintext --base64)
+            UNSEAL_KEY_3=$(aws kms decrypt --ciphertext-blob fileb:///vault/secrets/unseal-key-3.enc --output text --query Plaintext --base64)
+            
+            # Unseal Vault
+            vault operator unseal -address=https://vault:8200 $UNSEAL_KEY_1
+            vault operator unseal -address=https://vault:8200 $UNSEAL_KEY_2
+            vault operator unseal -address=https://vault:8200 $UNSEAL_KEY_3
+            
+            echo "Vault unsealed successfully!"
+          else
+            echo "Vault is already unsealed."
+          fi
+          
+          sleep 30
+        env:
+        - name: VAULT_ADDR
+          value: "https://vault:8200"
+        - name: VAULT_SKIP_VERIFY
+          value: "true"
+        volumeMounts:
+        - name: vault-secrets
+          mountPath: /vault/secrets
+          readOnly: true
+      volumes:
+      - name: vault-secrets
+        secret:
+          secretName: vault-unseal-keys
+
+---
+# External Secrets Operator Integration
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: vault-store
+  namespace: medallionx
+  labels:
+    app: vault
+    component: external-secrets
+spec:
+  provider:
+    vault:
+      server: "https://vault.medallionx.com:8200"
+      path: "secret"
+      version: "v2"
+      auth:
+        kubernetes:
+          mountPath: "auth/kubernetes"
+          role: "medallionx-trading"
+      caProvider:
+        secret:
+          name: vault-tls
+          key: ca.crt
+
+---
+# External Secret for Trading API Keys
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: trading-api-keys
+  namespace: medallionx
+  labels:
+    app: vault
+    component: external-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-store
+    kind: SecretStore
+  target:
+    name: medallionx-secrets
+    creationPolicy: Owner
+  data:
+  - secretKey: binance-api-key
+    remoteRef:
+      key: secret/data/medallionx/exchanges/binance
+      property: api_key
+  - secretKey: binance-secret
+    remoteRef:
+      key: secret/data/medallionx/exchanges/binance
+      property: secret
+  - secretKey: bybit-api-key
+    remoteRef:
+      key: secret/data/medallionx/exchanges/bybit
+      property: api_key
+  - secretKey: bybit-secret
+    remoteRef:
+      key: secret/data/medallionx/exchanges/bybit
+      property: secret
+  - secretKey: okx-api-key
+    remoteRef:
+      key: secret/data/medallionx/exchanges/okx
+      property: api_key
+  - secretKey: okx-secret
+    remoteRef:
+      key: secret/data/medallionx/exchanges/okx
+      property: secret
+
+---
+# External Secret for Monitoring Credentials
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: monitoring-credentials
+  namespace: medallionx
+  labels:
+    app: vault
+    component: external-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-store
+    kind: SecretStore
+  target:
+    name: grafana-secrets
+    creationPolicy: Owner
+  data:
+  - secretKey: admin-password
+    remoteRef:
+      key: secret/data/medallionx/monitoring/grafana
+      property: admin_password
+  - secretKey: telegram-bot-token
+    remoteRef:
+      key: secret/data/medallionx/monitoring/telegram
+      property: bot_token
+  - secretKey: openai-api-key
+    remoteRef:
+      key: secret/data/medallionx/monitoring/openai
+      property: api_key
+
+---
+# Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-network-policy
+  namespace: vault
+  labels:
+    app: vault
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: vault
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: medallionx
+    - namespaceSelector:
+        matchLabels:
+          name: vault
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53

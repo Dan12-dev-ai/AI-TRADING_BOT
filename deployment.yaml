@@ -1,0 +1,502 @@
+# Medallion-X Trading Bot - Kubernetes Deployment Configuration
+# Production-ready K8s deployment with self-healing and auto-scaling
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: medallionx-trading-engine
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: trading-engine
+    version: v1.0.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: medallionx
+      component: trading-engine
+  template:
+    metadata:
+      labels:
+        app: medallionx
+        component: trading-engine
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: medallionx-service-account
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: trading-engine
+        image: medallionx/trading-engine:v1.0.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: redis-url
+        - name: POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: postgres-url
+        - name: BINANCE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: binance-api-key
+        - name: BINANCE_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: binance-secret
+        - name: BYBIT_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: bybit-api-key
+        - name: BYBIT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: bybit-secret
+        - name: OKX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: okx-api-key
+        - name: OKX_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: okx-secret
+        - name: NEWSAPI_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: newsapi-key
+        - name: MORALIS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: moralis-key
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medallionx-secrets
+              key: openai-api-key
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+        - name: data
+          mountPath: /app/data
+        - name: models
+          mountPath: /app/models
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+      volumes:
+      - name: logs
+        persistentVolumeClaim:
+          claimName: medallionx-logs-pvc
+      - name: data
+        persistentVolumeClaim:
+          claimName: medallionx-data-pvc
+      - name: models
+        persistentVolumeClaim:
+          claimName: medallionx-models-pvc
+      - name: config
+        configMap:
+          name: medallionx-config
+      nodeSelector:
+        node-type: trading
+        zone: trading-zone
+      tolerations:
+      - key: "trading-node"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - medallionx
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medallionx-trading-engine-service
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: trading-engine
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: medallionx
+    component: trading-engine
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medallionx-trading-engine-nodeport
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: trading-engine
+spec:
+  type: NodePort
+  ports:
+  - port: 8000
+    targetPort: 8000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+  selector:
+    app: medallionx
+    component: trading-engine
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: medallionx-trading-engine-hpa
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: trading-engine
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: medallionx-trading-engine
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: medallionx-trading-engine-pdb
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: trading-engine
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: medallionx
+      component: trading-engine
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: medallionx-service-account
+  namespace: medallionx
+  labels:
+    app: medallionx
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: medallionx-role
+  namespace: medallionx
+  labels:
+    app: medallionx
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: medallionx-rolebinding
+  namespace: medallionx
+  labels:
+    app: medallionx
+subjects:
+- kind: ServiceAccount
+  name: medallionx-service-account
+  namespace: medallionx
+roleRef:
+  kind: Role
+  name: medallionx-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medallionx-config
+  namespace: medallionx
+  labels:
+    app: medallionx
+data:
+  logging.yaml: |
+    level: INFO
+    format: json
+    handlers:
+      - console
+      - file
+    file:
+      path: /app/logs/medallionx.log
+      max_size: 100MB
+      backup_count: 5
+  risk.yaml: |
+    max_portfolio_risk: 0.02
+    max_position_size: 0.1
+    kelly_multiplier: 0.25
+    stop_loss_atr_multiplier: 2.0
+    take_profit_atr_multiplier: 3.0
+  trading.yaml: |
+    max_slippage: 0.001
+    min_order_size: 0.001
+    execution_timeout_ms: 50
+    retry_attempts: 3
+    bad_setup_filter_threshold: 0.95
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: medallionx-logs-pvc
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: logs
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: medallionx-data-pvc
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: medallionx-models-pvc
+  namespace: medallionx
+  labels:
+    app: medallionx
+    component: models
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: medallionx-ingress
+  namespace: medallionx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - api.medallionx.com
+    secretName: medallionx-tls
+  rules:
+  - host: api.medallionx.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: medallionx-trading-engine-service
+            port:
+              number: 8000
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: medallionx-secrets
+  namespace: medallionx
+  labels:
+    app: medallionx
+type: Opaque
+data:
+  redis-url: cmVkaXM6Ly9yZWRpczo2Nzc5Lw==
+  postgres-url: cG9zdGdyZXNxbCwvbWVkYWxsb254eDp0ZXN0cGFzc3dvcmQ=
+  binance-api-key: <base64-encoded-api-key>
+  binance-secret: <base64-encoded-secret>
+  bybit-api-key: <base64-encoded-api-key>
+  bybit-secret: <base64-encoded-secret>
+  okx-api-key: <base64-encoded-api-key>
+  okx-secret: <base64-encoded-secret>
+  newsapi-key: <base64-encoded-api-key>
+  moralis-key: <base64-encoded-api-key>
+  openai-api-key: <base64-encoded-api-key>
+  telegram-bot-token: <base64-encoded-token>
+
+---
+# Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: medallionx-network-policy
+  namespace: medallionx
+  labels:
+    app: medallionx
+spec:
+  podSelector:
+    matchLabels:
+      app: medallionx
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app: medallionx
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
